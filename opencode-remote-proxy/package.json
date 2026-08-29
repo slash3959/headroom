@@ -1,0 +1,15 @@
+{
+  "name": "opencode-remote-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "opencode-remote-proxy": "opencode-remote-proxy.mjs"
+  },
+  "engines": {
+    "node": ">=20.6"
+  },
+  "scripts": {
+    "test": "node --test opencode-remote-proxy.test.mjs"
+  }
+}
