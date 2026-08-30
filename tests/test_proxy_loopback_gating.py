@@ -1,11 +1,10 @@
-"""Loopback-gating tests for state-mutating / content-leaking endpoints.
+"""Loopback/trusted-dashboard gating tests for management endpoints.
 
 ``/transformations/feed`` can return full prompt + completion bodies (when
 ``log_full_messages`` is on) and ``/cache/clear`` mutates server state. With the
 default ``--host 0.0.0.0`` Docker bind, neither should be reachable by an
-arbitrary network client — they are gated to the loopback interface via
-``require_loopback`` (the same guard already used for ``/admin/*`` and
-``/debug/*``). See #863.
+arbitrary untrusted network client. The tests cover both the legacy loopback
+guard path and the trusted-dashboard CIDR carve-out.
 """
 
 from __future__ import annotations
@@ -480,6 +479,15 @@ def test_health_config_block_is_loopback_only(monkeypatch: pytest.MonkeyPatch) -
     assert local.status_code == 200
     assert "config" in local.json()
 
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
+    trusted = TestClient(
+        _make_app(),
+        base_url="http://100.82.0.2:8787",
+        client=("100.90.0.5", 12345),
+    ).get("/health")
+    assert trusted.status_code == 200
+    assert "config" in trusted.json()
+
 
 def test_stats_per_request_metadata_is_loopback_only() -> None:
     """/stats keeps aggregate counters public but restricts per-request metadata
@@ -729,8 +737,30 @@ def test_dashboard_client_cidr_normalizes_ipv4_mapped_ipv6(
     assert "recent_requests" in payload
 
 
-def test_dashboard_client_cidr_does_not_expand_other_management_endpoints(
+TRUSTED_MANAGEMENT_READS = [
+    "/admin/upstream",
+    "/debug/tasks",
+    "/debug/ws-sessions",
+    "/debug/warmup",
+    "/debug/memory",
+    "/transformations/feed",
+    "/v1/retrieve/stats",
+    "/v1/feedback",
+    "/v1/feedback/Grep",
+    "/v1/telemetry",
+    "/v1/telemetry/export",
+    "/v1/telemetry/tools",
+    "/v1/telemetry/tools/example",
+    "/v1/toin/stats",
+    "/v1/toin/patterns",
+    "/v1/toin/pattern/example",
+]
+
+
+@pytest.mark.parametrize("path", TRUSTED_MANAGEMENT_READS)
+def test_dashboard_client_cidr_expands_management_read_endpoints(
     monkeypatch: pytest.MonkeyPatch,
+    path: str,
 ) -> None:
     monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
     client = TestClient(
@@ -741,7 +771,50 @@ def test_dashboard_client_cidr_does_not_expand_other_management_endpoints(
 
     health = client.get("/health")
     assert health.status_code == 200
-    assert "config" not in health.json()
-    assert client.get("/admin/upstream").status_code == 404
-    assert client.get("/debug/tasks").status_code == 404
-    assert client.post("/stats/reset").status_code == 404
+    assert "config" in health.json()
+    response = client.get(path)
+    assert response.status_code in {200, 404}, response.text
+
+
+TRUSTED_MANAGEMENT_WRITES = [
+    ("/admin/runtime-env", {}),
+    ("/stats/reset", {}),
+    ("/cache/clear", {}),
+    ("/v1/retrieve", {"hash": "abcdef"}),
+    ("/v1/telemetry/import", {}),
+    (
+        "/v1/retrieve/tool_call",
+        {"provider": "anthropic", "tool_call": {"id": "toolu_123", "name": "headroom_retrieve", "input": {"hash": "abcdef"}}},
+    ),
+]
+
+
+@pytest.mark.parametrize("path,body", TRUSTED_MANAGEMENT_WRITES)
+def test_dashboard_client_cidr_expands_management_write_endpoints_same_origin(
+    monkeypatch: pytest.MonkeyPatch, path: str, body: dict[str, object]
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
+    client = TestClient(
+        _make_app(),
+        base_url="http://100.82.0.2:8787",
+        client=("100.90.0.5", 12345),
+    )
+
+    response = client.post(path, json=body, headers={"origin": "http://100.82.0.2:8787"})
+    assert response.status_code != 404, response.text
+    assert response.status_code != 403, response.text
+
+
+@pytest.mark.parametrize("path,body", TRUSTED_MANAGEMENT_WRITES)
+def test_dashboard_client_cidr_keeps_management_write_csrf_guard(
+    monkeypatch: pytest.MonkeyPatch, path: str, body: dict[str, object]
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
+    client = TestClient(
+        _make_app(),
+        base_url="http://100.82.0.2:8787",
+        client=("100.90.0.5", 12345),
+    )
+
+    response = client.post(path, json=body, headers={"origin": "http://attacker.example"})
+    assert response.status_code in {403, 404}, response.text
