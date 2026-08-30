@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from headroom.providers.cursor import build_proxy_targets, render_setup_lines
 from headroom.providers.cursor.install import build_install_env
 
@@ -46,3 +48,13 @@ def test_cursor_setup_lines_mention_project_attribution() -> None:
 
     plain = "\n".join(render_setup_lines(8787))
     assert "attributed" not in plain
+
+
+def test_cursor_proxy_targets_accept_explicit_remote_proxy_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_REMOTE_PROXY_URL", "https://proxy.example/root")
+    targets = build_proxy_targets(9999, project="frontend")
+
+    assert targets.openai_base_url == "https://proxy.example/root/p/frontend/v1"
+    assert targets.anthropic_base_url == "https://proxy.example/root/p/frontend"

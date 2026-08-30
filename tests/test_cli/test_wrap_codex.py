@@ -1349,6 +1349,38 @@ def test_wrap_codex_routes_model_provider_selected_by_config_argument(
     assert configured_env[wrap_mod._UPSTREAM_BASE_URL_ENV_VAR] == ("https://api.example.test/v1")
 
 
+def test_codex_session_launch_settings_accepts_explicit_remote_proxy_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HEADROOM_REMOTE_PROXY_URL", "https://proxy.example/base")
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: "demo")
+    config_file = codex_home / "config.toml"
+    config_file.write_text('model = "gpt-5"\n', encoding="utf-8")
+
+    args, env, display = wrap_mod._codex_session_launch_settings(
+        port=9898,
+        codex_args=("exec", "hello"),
+        environ={
+            "CODEX_HOME": str(codex_home),
+            "HEADROOM_REMOTE_PROXY_URL": "https://proxy.example/base",
+        },
+    )
+
+    assert args == (
+        "--config",
+        'openai_base_url="https://proxy.example/base/p/demo/v1"',
+        "exec",
+        "hello",
+    )
+    assert env["OPENAI_BASE_URL"] == "https://proxy.example/base/p/demo/v1"
+    assert display == ["OPENAI_BASE_URL=https://proxy.example/base/p/demo/v1"]
+    assert config_file.read_text(encoding="utf-8") == 'model = "gpt-5"\n'
+
+
 def test_unwrap_codex_without_codex_home_warns_on_ambiguous_noop(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2043,3 +2075,41 @@ class TestCodexLaunchExportsCustomUpstream:
     ) -> None:
         env = self._launch_env(monkeypatch, tmp_path, custom_upstream=None)
         assert wrap_mod._UPSTREAM_BASE_URL_ENV_VAR not in env
+
+    def test_remote_proxy_ignores_stale_headroom_provider_as_upstream(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            "\n".join(
+                (
+                    'model_provider = "headroom"',
+                    "[model_providers.headroom]",
+                    'base_url = "http://127.0.0.1:8787/v1"',
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: None)
+
+        args, env, display = wrap_mod._codex_session_launch_settings(
+            port=8787,
+            codex_args=("exec",),
+            environ={
+                "CODEX_HOME": str(tmp_path),
+                "HEADROOM_REMOTE_PROXY_URL": "https://proxy.example/base",
+            },
+        )
+
+        assert args == (
+            "--config",
+            'model_providers.headroom.base_url="https://proxy.example/base/v1"',
+            "--config",
+            "model_providers.headroom.supports_websockets=true",
+            "exec",
+        )
+        assert env["OPENAI_BASE_URL"] == "https://proxy.example/base/v1"
+        assert wrap_mod._UPSTREAM_BASE_URL_ENV_VAR not in env
+        assert display == ["OPENAI_BASE_URL=https://proxy.example/base/v1"]

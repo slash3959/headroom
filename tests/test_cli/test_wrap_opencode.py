@@ -501,6 +501,32 @@ def test_wrap_opencode_injects_mcp_by_default(
     }
 
 
+def test_wrap_opencode_prepare_only_accepts_explicit_remote_proxy_url(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    result = runner.invoke(
+        main,
+        [
+            "wrap",
+            "opencode",
+            "--prepare-only",
+            "--no-mcp",
+        ],
+        env={"HEADROOM_REMOTE_PROXY_URL": "https://proxy.example/root"},
+    )
+
+    assert result.exit_code == 0, result.output
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config = json.loads(config_file.read_text(encoding="utf-8"))
+    assert config["provider"]["headroom"]["options"]["baseURL"] == ("https://proxy.example/root/v1")
+
+
 # ---------------------------------------------------------------------------
 # Unwrap opencode
 # ---------------------------------------------------------------------------

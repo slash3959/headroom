@@ -9,6 +9,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from headroom.proxy.project_policy import (
+    append_project_prefix,
+    configured_proxy_url,
+    with_project_prefix,
+)
+
 DEFAULT_API_URL = "https://api.openai.com"
 
 
@@ -20,17 +26,30 @@ class CodexRoutingDecision:
     is_chatgpt_auth: bool
 
 
-def proxy_base_url(port: int) -> str:
-    """Return the local proxy base URL used by OpenAI-compatible integrations."""
-    return f"http://127.0.0.1:{port}/v1"
+def proxy_base_url(
+    port: int,
+    project: str | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Return the proxy base URL used by OpenAI-compatible integrations."""
+    proxy_url = configured_proxy_url(environ)
+    if proxy_url:
+        base = append_project_prefix(proxy_url, project)
+    else:
+        base = with_project_prefix(f"http://127.0.0.1:{port}", project)
+    return f"{base}/v1"
 
 
 def build_launch_env(
-    port: int, environ: Mapping[str, str] | None = None
+    port: int,
+    environ: Mapping[str, str] | None = None,
+    *,
+    project: str | None = None,
 ) -> tuple[dict[str, str], list[str]]:
-    """Build environment variables for Codex through the local proxy."""
+    """Build environment variables for Codex through a local or remote proxy."""
     env = dict(environ or os.environ)
-    base_url = proxy_base_url(port)
+    base_url = proxy_base_url(port, project, environ=env)
     env["OPENAI_BASE_URL"] = base_url
     return env, [f"OPENAI_BASE_URL={base_url}"]
 

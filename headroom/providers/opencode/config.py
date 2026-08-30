@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ import click
 
 from headroom import fsutil
 from headroom.install.paths import opencode_config_path
+from headroom.proxy.project_policy import resolve_proxy_root
 
 # Headroom-managed JSON marker comments for idempotent block injection.
 _PROVIDER_MARKER_START = "// --- Headroom proxy provider ---"
@@ -54,12 +56,15 @@ HEADROOM_OPENCODE_MODELS: dict[str, Any] = {
 }
 
 
-def headroom_provider_entry(port: int) -> dict[str, Any]:
-    """Return the `headroom` provider block pointed at the local proxy."""
+def headroom_provider_entry(
+    port: int, *, environ: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Return the `headroom` provider block pointed at the proxy."""
+    base_url = resolve_proxy_root(port, environ)
     return {
         "npm": "@ai-sdk/openai-compatible",
         "name": "Headroom Proxy",
-        "options": {"baseURL": f"http://127.0.0.1:{port}/v1"},
+        "options": {"baseURL": f"{base_url}/v1"},
         "models": HEADROOM_OPENCODE_MODELS,
     }
 

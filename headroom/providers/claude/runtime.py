@@ -6,6 +6,12 @@ import re
 from collections.abc import Mapping
 from urllib.parse import urlparse
 
+from headroom.proxy.project_policy import (
+    append_project_prefix,
+    configured_proxy_url,
+    with_project_prefix,
+)
+
 DEFAULT_API_URL = "https://api.anthropic.com"
 
 # GH #746: Claude Code stops deferring MCP/system tool schemas (materializing
@@ -303,6 +309,14 @@ def remote_control_gate_active(
     return True
 
 
-def proxy_base_url(port: int) -> str:
-    """Return the local proxy base URL used by Claude integrations."""
-    return f"http://127.0.0.1:{port}"
+def proxy_base_url(
+    port: int,
+    project: str | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Return the proxy base URL used by Claude integrations."""
+    proxy_url = configured_proxy_url(environ)
+    if proxy_url:
+        return append_project_prefix(proxy_url, project)
+    return with_project_prefix(f"http://127.0.0.1:{port}", project)

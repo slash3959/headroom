@@ -94,6 +94,7 @@ from headroom.providers.claude import (
 )
 from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
 from headroom.providers.codex import build_launch_env as _build_codex_launch_env
+from headroom.providers.codex import proxy_base_url as _codex_proxy_base_url
 from headroom.providers.codex.install import codex_uses_chatgpt_auth
 from headroom.providers.codex.threads import retag_to_headroom, retag_to_native
 from headroom.providers.copilot import (
@@ -188,7 +189,7 @@ from headroom.providers.zcode import (
 from headroom.providers.zcode import (
     upstream_to_proxy_urls as _zcode_upstream_to_urls,
 )
-from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
+from headroom.proxy.project_policy import configured_proxy_url as _shared_configured_proxy_url
 
 from .main import main
 
@@ -224,6 +225,14 @@ def _read_text(path: Path) -> str:
 def _write_text(path: Path, content: str) -> None:
     """Write a text file as UTF-8 without translating line endings (preserves CRLF)."""
     fsutil.write_text(path, content)
+
+
+def _configured_proxy_url() -> str | None:
+    """Return the remote proxy URL, reporting a bad value as a CLI error."""
+    try:
+        return _shared_configured_proxy_url()
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _read_settings_for_write(path: Path) -> dict[str, Any]:
@@ -1932,8 +1941,8 @@ def _setup_headroom_mcp(
             click.echo(f"  MCP retrieve tool: {registrar.display_name} not detected — skipping")
         return
 
-    proxy_url = f"http://127.0.0.1:{port}"
-    spec = build_headroom_spec(proxy_url)
+    effective_proxy_url = _configured_proxy_url() or f"http://127.0.0.1:{port}"
+    spec = build_headroom_spec(effective_proxy_url)
     result = registrar.register_server(spec, force=force)
 
     line = format_result(
@@ -1941,7 +1950,7 @@ def _setup_headroom_mcp(
         result,
         label="MCP retrieve tool",
         verbose=verbose,
-        overwrite_hint=f"headroom mcp install --proxy-url {proxy_url} --force",
+        overwrite_hint=f"headroom mcp install --proxy-url {effective_proxy_url} --force",
         restart_hint=f"restart {registrar.display_name} if it was already running",
     )
     if line is not None:
@@ -2634,14 +2643,18 @@ def _codex_session_launch_settings(
     provider = str(provider)
 
     project = _project_name_from_cwd()
-    proxy_url = _with_project_prefix(f"http://127.0.0.1:{port}/v1", project)
+    proxy_url_with_v1 = _codex_proxy_base_url(port, project, environ=environ)
     overrides: list[str] = []
     env = dict(environ)
-    display = [f"OPENAI_BASE_URL={proxy_url}"]
-    env["OPENAI_BASE_URL"] = proxy_url
+    display = [f"OPENAI_BASE_URL={proxy_url_with_v1}"]
+    env["OPENAI_BASE_URL"] = proxy_url_with_v1
+    # Only this session's detected upstream may be advertised. An inherited value
+    # (nested wrap, or a shell that exported it) would otherwise ride the config's
+    # env_http_headers mapping and silently redirect the proxy somewhere stale.
+    env.pop(_UPSTREAM_BASE_URL_ENV_VAR, None)
 
     if provider == "openai":
-        overrides.append(f"openai_base_url={_codex_toml_value(proxy_url)}")
+        overrides.append(f"openai_base_url={_codex_toml_value(proxy_url_with_v1)}")
     else:
         providers = config.get("model_providers", {})
         provider_config = providers.get(provider) if isinstance(providers, dict) else None
@@ -2649,24 +2662,28 @@ def _codex_session_launch_settings(
             raise click.ClickException(
                 f"Codex provider {provider!r} cannot be redirected without changing its identity"
             )
-        upstream = provider_config.get("base_url")
-        if not isinstance(upstream, str) or not upstream.strip():
-            raise click.ClickException(
-                f"Codex custom provider {provider!r} has no upstream base_url"
-            )
         prefix = ("model_providers", provider)
         overrides.extend(
             (
-                f"{_codex_dotted_key(*prefix, 'base_url')}={_codex_toml_value(proxy_url)}",
+                f"{_codex_dotted_key(*prefix, 'base_url')}={_codex_toml_value(proxy_url_with_v1)}",
                 f"{_codex_dotted_key(*prefix, 'supports_websockets')}=true",
             )
         )
-        env[_UPSTREAM_BASE_URL_ENV_VAR] = upstream.rstrip("/")
-        display.append(f"{_UPSTREAM_BASE_URL_ENV_VAR}={upstream.rstrip('/')}")
-        overrides.append(
-            f"{_codex_dotted_key(*prefix, 'env_http_headers', _UPSTREAM_BASE_URL_HEADER_NAME)}="
-            f"{_codex_toml_value(_UPSTREAM_BASE_URL_ENV_VAR)}"
-        )
+        # "headroom" is our own managed provider block: its configured base_url
+        # is a Headroom proxy, not a real upstream, so it must not be advertised
+        # to the (possibly remote) session proxy as the forward target.
+        if provider != "headroom":
+            upstream = provider_config.get("base_url")
+            if not isinstance(upstream, str) or not upstream.strip():
+                raise click.ClickException(
+                    f"Codex custom provider {provider!r} has no upstream base_url"
+                )
+            env[_UPSTREAM_BASE_URL_ENV_VAR] = upstream.rstrip("/")
+            display.append(f"{_UPSTREAM_BASE_URL_ENV_VAR}={upstream.rstrip('/')}")
+            overrides.append(
+                f"{_codex_dotted_key(*prefix, 'env_http_headers', _UPSTREAM_BASE_URL_HEADER_NAME)}="
+                f"{_codex_toml_value(_UPSTREAM_BASE_URL_ENV_VAR)}"
+            )
 
     if project and "HEADROOM_PROJECT" not in env:
         env["HEADROOM_PROJECT"] = project
@@ -2824,7 +2841,7 @@ def _redirect_existing_top_level_keys(content: str, port: int) -> str:
             if current_key == "model_provider":
                 new_value = "headroom"
             else:  # openai_base_url
-                new_value = f"http://127.0.0.1:{current_port}/v1"
+                new_value = _codex_proxy_base_url(current_port)
             if original_value == new_value:
                 return match.group(0)
             # Keep the user's original value in a trailing comment so they
@@ -3104,7 +3121,7 @@ def _inject_codex_provider_config(port: int) -> str | None:
         f"{_CODEX_TOP_LEVEL_MARKER}\n"
         "[model_providers.headroom]\n"
         'name = "OpenAI via Headroom proxy"\n'
-        f'base_url = "http://127.0.0.1:{port}/v1"\n'
+        f'base_url = "{_codex_proxy_base_url(port)}"\n'
         f"supports_websockets = true\n"
         f"{requires_openai_auth}"
         # Inline table keeps the key inside this section so
@@ -3116,7 +3133,7 @@ def _inject_codex_provider_config(port: int) -> str | None:
     # The two redirectable keys and their headroom target values.
     _REDIRECT_TARGETS = {
         "model_provider": "headroom",
-        "openai_base_url": f"http://127.0.0.1:{port}/v1",
+        "openai_base_url": _codex_proxy_base_url(port),
     }
 
     def _build_top_level_block(user_content: str) -> str:
@@ -3299,12 +3316,15 @@ def _run_proxy_only_watcher(
     Pattern-B subcommands (cursor / cline / continue) all start the proxy,
     print agent-specific configuration instructions, then block until
     Ctrl+C. This helper unifies that lifecycle so the per-agent diff is
-    just the ``print_setup_lines`` callback.
+    just the ``print_setup_lines`` callback. Under a remote proxy no local
+    proxy is started: the setup lines point at the remote proxy and the
+    helper returns immediately.
 
     The Pattern-A subcommands (aider / copilot / codex / goose / openhands)
     launch a child binary via ``_launch_tool`` instead and never come
     through here. ``_launch_tool`` owns the proxy lifecycle on that path.
     """
+    proxy_url = _configured_proxy_url()
     proxy_holder: list[subprocess.Popen | None] = [None]
     port_holder: list[int] = [port]
     cleanup = _make_cleanup(proxy_holder, port_holder)
@@ -3348,6 +3368,11 @@ def _run_proxy_only_watcher(
         click.echo()
         print_setup_lines(actual_port)
         click.echo()
+
+        if proxy_url is not None:
+            # Nothing local to supervise: the remote proxy outlives this command.
+            return
+
         click.echo("  Press Ctrl+C to stop the proxy.")
         click.echo()
 
@@ -4012,8 +4037,12 @@ def _push_runtime_env(port: int, no_proxy: bool) -> None:
     Best-effort: a silent no-op when nothing is explicitly set, when there is no
     proxy (``--no-proxy``), when the proxy is unreachable, or when it predates
     the endpoint (older build returns 404).
+
+    Never pushed to a remote proxy: these knobs are process-global on the proxy
+    side, so one client's shell would silently reconfigure every other session
+    sharing it.
     """
-    if no_proxy:
+    if no_proxy or _configured_proxy_url() is not None:
         return
     from headroom.proxy import runtime_env as _rt
 
@@ -4466,12 +4495,44 @@ def _ensure_proxy(
     **kwargs: Any,
 ) -> tuple[subprocess.Popen | None, int]:
     """Start or reuse a proxy without racing another wrap on the same port."""
+    remote_proxy_url = _configured_proxy_url()
+    if remote_proxy_url is not None:
+        _announce_remote_proxy(remote_proxy_url)
+        return None, port
     if no_proxy:
         return _ensure_proxy_unlocked(port, no_proxy, **kwargs)
     with _proxy_start_lock(port):
         # Re-checking is part of the lock boundary: a concurrent wrapper may
         # have finished startup while this caller was waiting for the lock.
         return _ensure_proxy_unlocked(port, no_proxy, **kwargs)
+
+
+_remote_proxy_announced: set[str] = set()
+
+
+def _announce_remote_proxy(proxy_url: str) -> None:
+    """Report the remote target once and probe it before the agent launches.
+
+    A typo in ``HEADROOM_REMOTE_PROXY_URL`` is otherwise invisible until the
+    wrapped agent's first request fails, deep inside that agent's own error
+    handling where it reads as an upstream outage rather than a config mistake.
+    """
+    if proxy_url in _remote_proxy_announced:
+        return
+    _remote_proxy_announced.add(proxy_url)
+
+    import urllib.error
+    import urllib.request
+
+    click.echo(f"  Using remote proxy: {proxy_url}")
+    try:
+        with urllib.request.urlopen(f"{proxy_url}/health", timeout=2):
+            pass
+    except (OSError, urllib.error.URLError, ValueError):
+        click.echo(f"  Warning: {proxy_url}/health is unreachable — requests may fail.")
+    # Durable agent state (MCP registration, Codex config.toml) is rewritten to
+    # the remote URL and stays there until the next local wrap overwrites it.
+    click.echo("  Note: agent config written this session points at the remote proxy.")
 
 
 def _client_marker_path(port: int) -> Path:
@@ -4516,7 +4577,13 @@ def _register_proxy_client(port: int) -> None:
 
     Best-effort: a failed write just means our marker is missing, and the
     liveness pruning in :func:`_live_proxy_clients` is the real safety net.
+
+    A remote proxy has no local client registry and no lifecycle we own, so
+    there is nothing to claim: writing a marker for a port we never bound
+    would make an unrelated local proxy on that port look busy.
     """
+    if _configured_proxy_url() is not None:
+        return
     try:
         payload: dict[str, Any] = {"pid": os.getpid(), "started_at": time.time()}
         ident = _proc_identity(os.getpid())
@@ -4706,7 +4773,7 @@ def _launch_tool(
     ]
     | None = None,
 ) -> None:
-    """Common logic: start proxy, launch tool, clean up."""
+    """Common logic: start proxy when needed, launch tool, clean up."""
     proxy_holder: list[subprocess.Popen | None] = [None]
     port_holder: list[int] = [port]
     cleanup = _make_cleanup(proxy_holder, port_holder)
@@ -5154,6 +5221,15 @@ def claude(
     if prepare_only:
         return
 
+    remote_proxy_url = _configured_proxy_url()
+    if remote_proxy_url is not None and (
+        os.environ.get("CLAUDE_CODE_USE_VERTEX") or os.environ.get("CLAUDE_CODE_USE_FOUNDRY")
+    ):
+        raise click.ClickException(
+            "HEADROOM_REMOTE_PROXY_URL does not support Claude Vertex/Foundry "
+            "routing modes; use the standard local proxy path instead."
+        )
+
     claude_bin = shutil.which("claude")
     if not claude_bin:
         click.echo("Error: 'claude' not found in PATH.")
@@ -5301,7 +5377,7 @@ def claude(
             verbose=verbose,
         )
 
-        proxy_url = _claude_proxy_base_url(actual_port)
+        proxy_url = remote_proxy_url or _claude_proxy_base_url(actual_port)
         click.echo()
         click.echo("  Launching Claude Code (API routed through Headroom)...")
         if use_vertex:
@@ -5391,12 +5467,15 @@ def claude(
             foundry_mode=_settings_foundry[0],
             vertex_mode=_settings_vertex[0],
             settings_path=_wrap_settings_path,
-            port=port,
+            port=(None if remote_proxy_url else actual_port),
         )
-        # Issue #2221: pair the marker just written with a reader. wrap installs
-        # no hook of its own, so a session that only ran `wrap` (never `init`)
-        # had nothing to clear a dead-proxy base_url. SessionStart-only.
-        _ensure_claude_wrap_selfheal_hook(_wrap_settings_path)
+        # Issue #2221: pair the marker just written with a reader, but only for a
+        # local proxy whose liveness this port actually describes. A remote proxy
+        # may itself be a loopback URL (an SSH tunnel is the common case), so its
+        # port is unrelated to ``actual_port`` and the self-heal probe would clear
+        # a live base_url — or keep a dead one — based on the wrong socket.
+        if remote_proxy_url is None:
+            _ensure_claude_wrap_selfheal_hook(_wrap_settings_path)
 
         # Per-project savings attribution: tag every request with the launch
         # directory's name via X-Headroom-Project (user override wins).
@@ -5846,9 +5925,7 @@ def copilot(
             env["COPILOT_PROVIDER_TYPE"] = "openai"
             # Per-project savings: the Copilot CLI cannot send custom headers, so
             # the project rides as a /p/<name> base-URL prefix the proxy strips.
-            env["COPILOT_PROVIDER_BASE_URL"] = _with_project_prefix(
-                f"http://127.0.0.1:{port}/v1", _project_name_from_cwd()
-            )
+            env["COPILOT_PROVIDER_BASE_URL"] = _codex_proxy_base_url(port, _project_name_from_cwd())
             env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
             env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
             env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
@@ -6268,7 +6345,8 @@ def _run_codex_wrap(
     codex_args: tuple,
 ) -> None:
     """Execute the Codex wrap flow against the durable Codex home."""
-    if not no_proxy:
+    proxy_url = _configured_proxy_url()
+    if proxy_url is None and not no_proxy:
         ensure_proxy_dependencies()
 
     if prepare_only:
@@ -7080,7 +7158,7 @@ def cline(
 
     def _print_cline_setup(actual_port: int) -> None:
         anthropic_base = _claude_proxy_base_url(actual_port)
-        openai_base = f"http://127.0.0.1:{actual_port}/v1"
+        openai_base = _codex_proxy_base_url(actual_port)
         click.echo("  Configure Cline in VS Code:")
         click.echo("    Settings > Cline > API Provider")
         click.echo(f"    Anthropic Base URL: {anthropic_base}")
@@ -7224,7 +7302,7 @@ def continue_dev(
 
     def _print_continue_setup(actual_port: int) -> None:
         anthropic_base = _claude_proxy_base_url(actual_port)
-        openai_base = f"http://127.0.0.1:{actual_port}/v1"
+        openai_base = _codex_proxy_base_url(actual_port)
         click.echo("  Configure Continue in your IDE:")
         click.echo(f"    Edit {config_file} and set, per model:")
         click.echo(f'      "apiBase": "{openai_base}"          # OpenAI-compatible models')
@@ -7307,7 +7385,7 @@ def goose(
 
     # Goose accepts OpenAI- and Anthropic-compatible providers; route both.
     env = os.environ.copy()
-    openai_base = f"http://127.0.0.1:{port}/v1"
+    openai_base = _codex_proxy_base_url(port)
     anthropic_base = _claude_proxy_base_url(port)
     env["OPENAI_BASE_URL"] = openai_base
     env["OPENAI_API_BASE"] = openai_base
@@ -7395,7 +7473,7 @@ def openhands(
         raise SystemExit(1)
 
     env = os.environ.copy()
-    openai_base = f"http://127.0.0.1:{port}/v1"
+    openai_base = _codex_proxy_base_url(port)
     anthropic_base = _claude_proxy_base_url(port)
     env["OPENAI_BASE_URL"] = openai_base
     env["OPENAI_API_BASE"] = openai_base
@@ -7734,6 +7812,7 @@ def opencode(
         headroom wrap opencode --backend anyllm --anyllm-provider groq
         headroom wrap opencode --copilot-subscription # Use a GitHub Copilot subscription
     """
+    proxy_url = _configured_proxy_url()
     subscription_resolution = None
     if copilot_subscription:
         effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
@@ -7746,6 +7825,11 @@ def opencode(
             raise click.ClickException(
                 "--copilot-subscription cannot be combined with --no-proxy because "
                 "it requires a private seeded proxy."
+            )
+        if proxy_url is not None:
+            raise click.ClickException(
+                "--copilot-subscription cannot be combined with HEADROOM_REMOTE_PROXY_URL "
+                "because it requires a private seeded local proxy."
             )
         if prepare_only:
             raise click.ClickException(

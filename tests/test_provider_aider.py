@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from headroom.providers.aider.install import build_install_env
 from headroom.providers.aider.runtime import build_launch_env
 
@@ -49,3 +51,21 @@ def test_aider_build_launch_env_ignores_unusable_project() -> None:
 
     assert env["OPENAI_API_BASE"] == "http://127.0.0.1:9999/v1"
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9999"
+
+
+def test_aider_build_launch_env_accepts_explicit_remote_proxy_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_REMOTE_PROXY_URL", "https://proxy.example/base")
+    env, lines = build_launch_env(
+        port=9999,
+        environ={},
+        project="my repo",
+    )
+
+    assert env["OPENAI_API_BASE"] == "https://proxy.example/base/p/my%20repo/v1"
+    assert env["ANTHROPIC_BASE_URL"] == "https://proxy.example/base/p/my%20repo"
+    assert lines == [
+        "OPENAI_API_BASE=https://proxy.example/base/p/my%20repo/v1",
+        "ANTHROPIC_BASE_URL=https://proxy.example/base/p/my%20repo",
+    ]

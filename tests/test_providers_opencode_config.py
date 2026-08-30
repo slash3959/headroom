@@ -543,6 +543,43 @@ def test_proxy_base_url() -> None:
     assert proxy_base_url(9000) == "http://127.0.0.1:9000/v1"
 
 
+def test_build_opencode_config_content_accepts_explicit_remote_proxy_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from headroom.providers.opencode.runtime import build_opencode_config_content
+
+    monkeypatch.setenv("HEADROOM_REMOTE_PROXY_URL", "https://proxy.example/root")
+    config = build_opencode_config_content(port=8787)
+
+    assert config["provider"]["anthropic"]["options"]["baseURL"] == "https://proxy.example/root/v1"
+    assert config["provider"]["openai"]["options"]["baseURL"] == "https://proxy.example/root/v1"
+    assert config["provider"]["headroom"]["options"]["baseURL"] == "https://proxy.example/root/v1"
+    assert config["mcp"]["headroom"]["environment"] == {
+        "HEADROOM_PROXY_URL": "https://proxy.example/root"
+    }
+
+
+def test_build_launch_env_exports_explicit_remote_proxy_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from headroom.providers.opencode.runtime import build_launch_env
+
+    plugin = tmp_path / "entry.opencode.js"
+    plugin.write_text("export default () => {}", encoding="utf-8")
+    monkeypatch.setenv("HEADROOM_OPENCODE_PLUGIN_PATH", str(plugin))
+    monkeypatch.setenv("HEADROOM_REMOTE_PROXY_URL", "https://proxy.example/root")
+
+    env, _display = build_launch_env(
+        port=8787,
+        environ={},
+        include_mcp=False,
+    )
+
+    assert env["HEADROOM_PROXY_URL"] == "https://proxy.example/root"
+    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    assert config["provider"]["anthropic"]["options"]["baseURL"] == "https://proxy.example/root/v1"
+
+
 def test_inject_provider_config_strips_existing_markers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
